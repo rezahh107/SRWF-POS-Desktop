@@ -46,6 +46,30 @@ public class ObservationDiagnosticsAndArchiveTests
     }
 
     [Fact]
+    public void TempRenameWithoutFinalByteCaptureRemainsPublishIncomplete()
+    {
+        using var fixture = new Fixture();
+        var collector = fixture.Collector();
+        var tempPath = Path.Combine(fixture.Request, "tx.tmp");
+        var finalPath = Path.Combine(fixture.Request, "TransAction.txt");
+        var raw = Encoding.ASCII.GetBytes("Amount=100\r\ntype=1\r\nIP=1\r\nport=2\r\n");
+
+        collector.RecordEvent("Request", "Created", tempPath, status: "REQUEST_EVENT_OBSERVED");
+        collector.RecordRequestCapture(new("Request", tempPath, "tx.tmp", DateTimeOffset.UtcNow, DateTime.UtcNow, DateTime.UtcNow, raw, Hashing.Sha256(raw)),
+            new(100, TesterDisplayedUnit.Unknown));
+        collector.RecordEvent("Request", "Renamed", finalPath, oldPath: tempPath, status: "REQUEST_EVENT_OBSERVED");
+
+        collector.FinalizePublicationPattern(finalPathExistedBefore: false);
+
+        Assert.NotNull(collector.RequestContract);
+        Assert.Equal(PublicationPattern.TempFileThenRename, collector.RequestContract!.PublicationPattern);
+        Assert.Equal(finalPath, collector.RequestContract.DestinationPath);
+        Assert.Equal("tx.tmp", collector.RequestContract.ObservedTemporaryFileName);
+        Assert.Equal("INCOMPLETE", collector.RequestContract.PublicationStrategyConfidence);
+        Assert.False(collector.RequestContract.HasReproducibleStructure);
+    }
+
+    [Fact]
     public async Task SafeBundleExcludesRawResponseByDefault()
     {
         using var fixture = new Fixture();
