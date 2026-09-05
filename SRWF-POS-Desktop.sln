@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SRWF.POS.PecProbe.Core", "src\SRWF.POS.PecProbe.Core\SRWF.POS.PecProbe.Core.csproj", "{C2529E4F-C74B-4E4E-9F4C-E4F0B1EB5201}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SRWF.POS.PecProbe.App", "src\SRWF.POS.PecProbe.App\SRWF.POS.PecProbe.App.csproj", "{5D888D02-B3F8-4DBD-AD0B-BE90AF790202}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SRWF.POS.PecProbe.Tests", "tests\SRWF.POS.PecProbe.Tests\SRWF.POS.PecProbe.Tests.csproj", "{98CB4FA0-730D-40A8-8427-92D178340303}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{C2529E4F-C74B-4E4E-9F4C-E4F0B1EB5201}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C2529E4F-C74B-4E4E-9F4C-E4F0B1EB5201}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C2529E4F-C74B-4E4E-9F4C-E4F0B1EB5201}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C2529E4F-C74B-4E4E-9F4C-E4F0B1EB5201}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5D888D02-B3F8-4DBD-AD0B-BE90AF790202}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5D888D02-B3F8-4DBD-AD0B-BE90AF790202}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5D888D02-B3F8-4DBD-AD0B-BE90AF790202}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5D888D02-B3F8-4DBD-AD0B-BE90AF790202}.Release|Any CPU.Build.0 = Release|Any CPU
+		{98CB4FA0-730D-40A8-8427-92D178340303}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{98CB4FA0-730D-40A8-8427-92D178340303}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{98CB4FA0-730D-40A8-8427-92D178340303}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{98CB4FA0-730D-40A8-8427-92D178340303}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
