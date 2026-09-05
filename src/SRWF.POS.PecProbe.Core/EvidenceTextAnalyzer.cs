@@ -65,9 +65,12 @@ public static class EvidenceTextAnalyzer
 
     private static (Encoding? Encoding, string Name, int BomLength, bool Safe) DetectEncoding(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.StartsWith([0xEF, 0xBB, 0xBF])) return (new UTF8Encoding(false, true), "UTF-8", 3, true);
-        if (bytes.StartsWith([0xFF, 0xFE])) return (Encoding.Unicode, "UTF-16LE", 2, true);
-        if (bytes.StartsWith([0xFE, 0xFF])) return (Encoding.BigEndianUnicode, "UTF-16BE", 2, true);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return (new UTF8Encoding(false, true), "UTF-8", 3, true);
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            return (Encoding.Unicode, "UTF-16LE", 2, true);
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            return (Encoding.BigEndianUnicode, "UTF-16BE", 2, true);
 
         if (bytes.ToArray().All(b => b < 0x80)) return (Encoding.ASCII, "ASCII", 0, true);
 
