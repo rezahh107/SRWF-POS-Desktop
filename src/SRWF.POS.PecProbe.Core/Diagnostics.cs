@@ -104,6 +104,39 @@ public sealed class DiagnosticCollector
         lock (_gate)
         {
             if (RequestContract is null) return;
+
+            var currentPath = Path.GetFullPath(RequestContract.DestinationPath);
+            var forwardRename = _events
+                .Where(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase) && e.OldFullPath is not null)
+                .OrderBy(e => e.Sequence)
+                .FirstOrDefault(e => string.Equals(Path.GetFullPath(e.OldFullPath!), currentPath, StringComparison.OrdinalIgnoreCase));
+
+            if (forwardRename is not null)
+            {
+                var finalPath = Path.GetFullPath(forwardRename.FullPath);
+                var finalCapture = _events
+                    .Where(e => e.EvidenceStatus == "REQUEST_CONTENT_CAPTURED")
+                    .OrderByDescending(e => e.Sequence)
+                    .FirstOrDefault(e => string.Equals(Path.GetFullPath(e.FullPath), finalPath, StringComparison.OrdinalIgnoreCase));
+                var capturedBytesAreProvenAtFinalPath = finalCapture?.Sha256 is not null &&
+                    string.Equals(finalCapture.Sha256, Hashing.Sha256(RequestContract.ObservedRawBytes), StringComparison.OrdinalIgnoreCase);
+
+                RequestContract = RequestContract with
+                {
+                    DestinationPath = forwardRename.FullPath,
+                    FileName = Path.GetFileName(forwardRename.FullPath),
+                    PublicationPattern = PublicationPattern.TempFileThenRename,
+                    PublicationStrategyEvidence = capturedBytesAreProvenAtFinalPath
+                        ? "Captured Request bytes were observed at the temporary path and the same SHA-256 was captured at the rename destination."
+                        : "A captured temporary Request was renamed to the final path, but identical final-path bytes were not captured; publication structure remains incomplete.",
+                    PublicationStrategyConfidence = capturedBytesAreProvenAtFinalPath ? "HIGH" : "INCOMPLETE",
+                    ObservedTemporaryFileName = Path.GetFileName(forwardRename.OldFullPath!),
+                    AmountFieldName = capturedBytesAreProvenAtFinalPath ? RequestContract.AmountFieldName : null
+                };
+                WriteContractFiles();
+                return;
+            }
+
             var inference = PublicationPatternInferer.Infer(_events, RequestContract.DestinationPath, finalPathExistedBefore);
             var rename = _events
                 .Where(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase) && e.OldFullPath is not null)
