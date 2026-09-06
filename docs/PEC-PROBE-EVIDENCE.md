@@ -78,27 +78,76 @@ The following remain explicitly open until evidence closes a specific item:
 - cleanup/archive rules accepted by PEC;
 - whether Request disappearance implies anything about payment outcome.
 
+## Capture qualification
+
+A readable Request sample is useful raw evidence but is not automatically a reproducible contract.
+
+For a Request capture to become normal-PUBLISH-eligible evidence, the Probe requires bounded stability evidence:
+
+- at least two successful shared reads;
+- identical bytes/SHA-256 across the qualifying samples;
+- stable relevant file metadata before and after each qualifying read;
+- no later conflicting sample before observation finalization.
+
+Raw candidate samples are retained even when stability cannot be established. Outcomes such as `REQUEST_CONTENT_UNSTABLE`, `REQUEST_CONTENT_DISAPPEARED_BEFORE_CONFIRMATION`, and `REQUEST_CONTENT_NOT_CAPTURED` remain truthful evidence outcomes and do not become guessed Request contents.
+
+Stable bytes alone do not prove the publication method. Normal publication evidence additionally requires one of the bounded observed patterns:
+
+- `DIRECT_CREATE_AND_WRITE`: positive creation visibility at the final path, stable final-path bytes, and no conflicting rename evidence;
+- `TEMP_FILE_THEN_RENAME`: observed temporary filename/rename evidence plus byte-equivalent stable evidence at the final destination where required by the observed sequence.
+
+Changed-only activity is insufficient to prove direct creation.
+
+## Prepared Request fidelity
+
+The observed Tester Request remains the rendering authority. The renderer may change only explicitly supported fields, while preserving:
+
+- encoding;
+- BOM presence;
+- exact line-delimiter sequence, including CRLF/LF/CR where observed;
+- final-newline presence/absence;
+- field order;
+- all non-replaced text and unknown fields.
+
+Before normal dispatch, the prepared Request is mechanically compared with the observed evidence. `DIFFERENT` and `NOT_COMPARABLE` are fail-closed outcomes and cannot be normal-PUBLISH evidence. `STRUCTURALLY_EQUIVALENT` means only that the permitted dynamic fields differ while the checked structure is preserved; it is not `BYTE_IDENTICAL` and it is not official PEC validation.
+
+## Durable recovery evidence
+
+Per-session diagnostic evidence is also the recovery authority for prior PUBLISH attempts. A durable `publish-attempt.json`, an observed dispatch marker, or unreadable/corrupt relevant publish evidence is treated conservatively as an unresolved prior attempt unless an already-authoritative safe resolution exists.
+
+The current POC has no authority to invent such a resolution from candidate Response mappings. Therefore:
+
+- empty provider Request/Response directories do not clear a prior-attempt block;
+- candidate Response evidence does not automatically make retry safe;
+- `UNVERIFIED PUBLISH OVERRIDE` does not bypass the unresolved single-flight rule;
+- OBSERVE ONLY remains available for further evidence gathering.
+
+This recovery rule does not create a second global transaction truth source; it derives the block from the existing per-session diagnostics.
+
 ## Evidence upgrade rules
 
 1. Raw bytes are preserved before parsing or normalization.
 2. Filesystem events and captures are timestamped and hashed.
 3. Operator-entered Tester amount/unit is stored as `OWNER_REPORTED_INPUT`.
 4. A measured amount relationship may become `AMOUNT_RELATION_OBSERVED` but remains `AMOUNT_UNIT_NOT_PROVEN` until stronger evidence exists.
-5. A detected write/rename pattern is a candidate publication behavior for the tested Tester/service version; it is not universal PEC protocol authority.
-6. Response parsing never upgrades a candidate code to official semantics by itself.
-7. Physical PEC evidence must record the terminal/service/environment version and visible outcome.
-8. Conflicting observations lower confidence; they are not normalized away.
+5. Request content becomes reproducible candidate evidence only after bounded stable-capture qualification; conflicting/uncertain samples remain evidence but do not qualify normal PUBLISH.
+6. A detected write/rename pattern is a candidate publication behavior for the tested Tester/service version; it is not universal PEC protocol authority.
+7. Response parsing never upgrades a candidate code to official semantics by itself.
+8. Physical PEC evidence must record the terminal/service/environment version and visible outcome.
+9. Conflicting observations lower confidence; they are not normalized away.
+10. A prepared Request must pass the structural pre-dispatch comparison before normal publication.
 
 ## Evidence expected from the first real observation session
 
 - pre-session Request/Response directory snapshots;
 - ordered `FileSystemWatcher` + polling timeline;
 - Request event presence even if content is missed;
-- exact Request bytes when captured;
+- exact raw Request samples when captured;
+- bounded capture-stability evidence and sample hashes/metadata;
 - SHA-256, byte length, timestamps;
 - probable encoding/BOM/newline/final-newline information;
 - field order without forcing candidate schema;
-- publication-pattern inference and confidence;
+- publication-pattern inference, supporting events, and confidence;
 - operator-entered Tester amount/unit;
 - observed Request amount candidate and relation analysis;
 - exact Response bytes before parsing when captured;
