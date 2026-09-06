@@ -41,23 +41,7 @@ internal static class PecRequestPublisher
                     throw new InvalidOperationException("PUBLISH_CONTRACT_INCOMPLETE: temp-file naming/rename semantics were not observed.");
                 }
 
-                if (File.Exists(temp)) throw new IOException("RECOVERY_REQUIRED: temporary Request path already exists.");
-                try
-                {
-                    await using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, true))
-                    {
-                        await stream.WriteAsync(bytes, cancellationToken);
-                        await stream.FlushAsync(cancellationToken);
-                    }
-                    File.Move(temp, destinationPath, overwrite: false);
-                }
-                catch
-                {
-                    // Never delete an observed provider artifact. This cleanup applies only to the Probe-created
-                    // temporary file and only before rename completed.
-                    try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-                    throw;
-                }
+                await SafeFilePublication.TempThenRenameAsync(temp, destinationPath, bytes, cancellationToken);
                 break;
 
             case PublicationStrategy.OtherObserved:
