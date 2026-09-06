@@ -26,11 +26,16 @@ public class RecoveryAndCaptureTests
             initialMode = "ObserveOnly",
             status = "OBSERVATION_STOPPED"
         }));
-        File.WriteAllText(Path.Combine(session, "timeline.jsonl"), "{\"evidenceStatus\":\"REQUEST_EVENT_OBSERVED\"}\n");
+        WriteTimeline(session, Event(
+            directoryRole: "Request",
+            evidenceStatus: "REQUEST_EVENT_OBSERVED",
+            fullPath: Path.Combine(sandbox.Path, "DISPATCH_STARTED.txt"),
+            note: "REQUEST_FILE_PUBLISHED may appear in ordinary observation notes"));
 
         var result = SessionRecoveryClassifier.Assess(sandbox.Path);
 
         Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
     }
 
     [Fact]
@@ -56,16 +61,124 @@ public class RecoveryAndCaptureTests
     }
 
     [Fact]
-    public void DispatchTimelineMarkerAlsoRestoresRecoveryBlock()
+    public void StructuredDispatchStartedTimelineEventRestoresRecoveryBlock()
     {
-        using var sandbox = new TempDirectory("srwf-recovery-timeline");
+        using var sandbox = new TempDirectory("srwf-recovery-dispatch-started");
         var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-publish")).FullName;
-        File.WriteAllText(Path.Combine(session, "timeline.jsonl"), "{\"evidenceStatus\":\"DISPATCH_STARTED\"}\n");
+        WriteTimeline(session, Event("Publish", "DISPATCH_STARTED"));
 
         var result = SessionRecoveryClassifier.Assess(sandbox.Path);
 
         Assert.True(result.RecoveryRequired);
-        Assert.Contains(result.Findings, f => f.Status == "UNRESOLVED_DISPATCH_MARKER");
+        Assert.Equal("RECOVERY_REQUIRED", result.Status);
+        Assert.Contains(result.Findings, f =>
+            f.Status == "UNRESOLVED_DISPATCH_MARKER" &&
+            f.Detail == "DISPATCH_STARTED");
+    }
+
+    [Fact]
+    public void StructuredRequestFilePublishedTimelineEventRestoresRecoveryBlock()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-request-published");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-publish")).FullName;
+        WriteTimeline(session, Event("Publish", "REQUEST_FILE_PUBLISHED"));
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.True(result.RecoveryRequired);
+        Assert.Equal("RECOVERY_REQUIRED", result.Status);
+        Assert.Contains(result.Findings, f =>
+            f.Status == "UNRESOLVED_DISPATCH_MARKER" &&
+            f.Detail == "REQUEST_FILE_PUBLISHED");
+    }
+
+    [Fact]
+    public void DispatchMarkerTextInFullPathDoesNotFabricateRecoveryBlock()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-path-collision");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-observe")).FullName;
+        WriteTimeline(session, Event(
+            directoryRole: "Request",
+            evidenceStatus: "REQUEST_EVENT_OBSERVED",
+            fullPath: Path.Combine(sandbox.Path, "DISPATCH_STARTED.txt")));
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
+    }
+
+    [Fact]
+    public void DispatchMarkerTextInNoteDoesNotFabricateRecoveryBlock()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-note-collision");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-observe")).FullName;
+        WriteTimeline(session, Event(
+            directoryRole: "Request",
+            evidenceStatus: "REQUEST_EVENT_OBSERVED",
+            note: "REQUEST_FILE_PUBLISHED"));
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
+    }
+
+    [Theory]
+    [InlineData("NOT_DISPATCH_STARTED")]
+    [InlineData("DISPATCH_STARTED_CANDIDATE")]
+    [InlineData("REQUEST_FILE_PUBLISHED_NOTE")]
+    public void SimilarButNonExactDispatchStatusDoesNotBlock(string evidenceStatus)
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-nonexact");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-publish-looking")).FullName;
+        WriteTimeline(session, Event("Publish", evidenceStatus));
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
+    }
+
+    [Fact]
+    public void MarkerStatusOutsidePublishRoleDoesNotBlock()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-role-boundary");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-observe")).FullName;
+        WriteTimeline(session, Event("Request", "DISPATCH_STARTED"));
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
+    }
+
+    [Fact]
+    public void MalformedTimelineRecordAloneDoesNotFabricatePriorPublish()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-malformed");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-observe")).FullName;
+        File.WriteAllText(Path.Combine(session, "timeline.jsonl"), "{not-json" + Environment.NewLine);
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.False(result.RecoveryRequired);
+        Assert.Equal("NO_PRIOR_PUBLISH_EVIDENCE", result.Status);
+    }
+
+    [Fact]
+    public void MalformedTimelineRecordDoesNotHideLaterStructuredDispatchEvidence()
+    {
+        using var sandbox = new TempDirectory("srwf-recovery-malformed-before-dispatch");
+        var session = Directory.CreateDirectory(Path.Combine(sandbox.Path, "session-publish")).FullName;
+        var timeline = Path.Combine(session, "timeline.jsonl");
+        File.WriteAllText(timeline, "{not-json" + Environment.NewLine);
+        File.AppendAllText(timeline, JsonSerializer.Serialize(Event("Publish", "DISPATCH_STARTED")) + Environment.NewLine);
+
+        var result = SessionRecoveryClassifier.Assess(sandbox.Path);
+
+        Assert.True(result.RecoveryRequired);
+        Assert.Contains(result.Findings, f => f.Status == "UNRESOLVED_DISPATCH_MARKER" && f.Detail == "DISPATCH_STARTED");
     }
 
     [Fact]
@@ -162,6 +275,27 @@ public class RecoveryAndCaptureTests
         Assert.False(capture.StabilityEstablished);
         Assert.Equal(Hashing.Sha256(bytes), capture.Sha256);
         Assert.NotEmpty(capture.Samples!);
+    }
+
+    private static FilesystemEventRecord Event(
+        string directoryRole,
+        string evidenceStatus,
+        string? fullPath = null,
+        string? note = null) => new(
+            Sequence: 1,
+            TimestampUtc: DateTimeOffset.UtcNow,
+            DirectoryRole: directoryRole,
+            EventType: "Created",
+            FullPath: fullPath ?? Path.Combine(Path.GetTempPath(), "TransAction.txt"),
+            FileName: Path.GetFileName(fullPath ?? "TransAction.txt"),
+            EvidenceStatus: evidenceStatus,
+            Note: note);
+
+    private static void WriteTimeline(string sessionDirectory, params FilesystemEventRecord[] events)
+    {
+        File.WriteAllLines(
+            Path.Combine(sessionDirectory, "timeline.jsonl"),
+            events.Select(JsonSerializer.Serialize));
     }
 
     private sealed class TempDirectory : IDisposable
