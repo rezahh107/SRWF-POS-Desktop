@@ -4,7 +4,16 @@ namespace SRWF.POS.PecProbe.Core;
 
 public static class SessionRecoveryClassifier
 {
-    private static readonly string[] DispatchMarkers = ["DISPATCH_STARTED", "REQUEST_FILE_PUBLISHED"];
+    private static readonly HashSet<string> DispatchMarkers = new(StringComparer.Ordinal)
+    {
+        "DISPATCH_STARTED",
+        "REQUEST_FILE_PUBLISHED"
+    };
+
+    private static readonly JsonSerializerOptions TimelineJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     public static RecoveryAssessment Assess(string diagnosticsRoot)
     {
@@ -48,11 +57,14 @@ public static class SessionRecoveryClassifier
 
             try
             {
-                var marker = File.ReadLines(timeline)
-                    .SelectMany(line => DispatchMarkers.Where(marker => line.Contains(marker, StringComparison.Ordinal)))
-                    .FirstOrDefault();
-                if (marker is not null)
+                foreach (var line in File.ReadLines(timeline))
+                {
+                    if (!TryGetDispatchMarker(line, out var marker))
+                        continue;
+
                     findings.Add(new(sessionDirectory, "timeline.jsonl", "UNRESOLVED_DISPATCH_MARKER", marker));
+                    break;
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -65,4 +77,34 @@ public static class SessionRecoveryClassifier
             ? new(false, "NO_PRIOR_PUBLISH_EVIDENCE", [])
             : new(true, "RECOVERY_REQUIRED", findings);
     }
+
+    private static bool TryGetDispatchMarker(string line, out string? marker)
+    {
+        marker = null;
+        if (string.IsNullOrWhiteSpace(line))
+            return false;
+
+        TimelineEventIdentity? record;
+        try
+        {
+            record = JsonSerializer.Deserialize<TimelineEventIdentity>(line, TimelineJsonOptions);
+        }
+        catch (JsonException)
+        {
+            // timeline.jsonl is compatibility/fallback evidence, not the primary durable publish authority.
+            // Preserve malformed evidence on disk and do not infer a dispatch from free text inside invalid JSON.
+            return false;
+        }
+
+        if (record is null ||
+            !string.Equals(record.DirectoryRole, "Publish", StringComparison.Ordinal) ||
+            record.EvidenceStatus is null ||
+            !DispatchMarkers.Contains(record.EvidenceStatus))
+            return false;
+
+        marker = record.EvidenceStatus;
+        return true;
+    }
+
+    private sealed record TimelineEventIdentity(string? DirectoryRole, string? EvidenceStatus);
 }
