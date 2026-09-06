@@ -11,6 +11,8 @@ public sealed class DiagnosticCollector
     private long _sequence;
     private readonly List<FilesystemEventRecord> _events = [];
     private readonly List<string> _errors = [];
+    private string? _promotedRequestHash;
+    private bool _requestConflictObserved;
 
     public string SessionDirectory { get; }
     public DiagnosticSessionMetadata Session { get; private set; }
@@ -70,30 +72,61 @@ public sealed class DiagnosticCollector
         lock (_gate)
         {
             LatestRequestCapture = capture;
-            var seq = Interlocked.Read(ref _sequence);
-            File.WriteAllBytes(Path.Combine(SessionDirectory, "request-candidates", $"{seq:D8}-{SafeName(capture.FileName)}.raw"), capture.RawBytes);
-            File.WriteAllBytes(Path.Combine(SessionDirectory, "observed-request.raw"), capture.RawBytes);
-            var evidence = EvidenceTextAnalyzer.Analyze(capture.RawBytes);
-            WriteJson("observed-request-metadata.json", new
+            PersistRequestSamples(capture);
+            WriteJson("request-capture-stability.json", new
             {
-                status = "REQUEST_CONTENT_CAPTURED",
-                capture.FileName,
                 capture.FullPath,
-                byteLength = capture.RawBytes.Length,
-                capture.Sha256,
-                capture.CreationTimeUtc,
-                capture.LastWriteTimeUtc,
+                capture.FileName,
                 capture.CapturedAtUtc,
-                evidence.ProbableEncoding,
-                evidence.BomPresent,
-                evidence.NewlineRepresentation,
-                evidence.FinalNewlinePresent,
-                evidence.DecodingSafe,
-                fieldOrder = evidence.FieldNames
+                capture.Stability,
+                capture.SuccessfulSampleCount,
+                stabilityEstablished = capture.StabilityEstablished,
+                sampleHashes = (capture.Samples ?? []).Select(s => new
+                {
+                    s.SampleNumber,
+                    s.SampledAtUtc,
+                    s.LengthBefore,
+                    s.LengthAfter,
+                    s.CreationTimeUtcBefore,
+                    s.CreationTimeUtcAfter,
+                    s.LastWriteTimeUtcBefore,
+                    s.LastWriteTimeUtcAfter,
+                    s.Sha256,
+                    s.MetadataStableAcrossRead
+                }).ToArray()
             });
-            RequestContract = CandidateRequestAnalyzer.Analyze(capture);
-            AmountAnalysis = AmountRelationAnalyzer.Analyze(input, RequestContract.ObservedRawAmount);
-            WriteContractFiles();
+
+            if (capture.StabilityEstablished)
+            {
+                if (RequestContract is null && !_requestConflictObserved)
+                {
+                    PromoteStableRequest(capture, input);
+                    return;
+                }
+
+                if (RequestContract is not null &&
+                    string.Equals(_promotedRequestHash, capture.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    RequestContract = RequestContract with
+                    {
+                        StableSampleCount = Math.Max(RequestContract.StableSampleCount, capture.SuccessfulSampleCount),
+                        CaptureStabilityEvidence = $"Stable repeated capture reconfirmed; successfulSamples={capture.SuccessfulSampleCount}."
+                    };
+                    WriteContractFiles();
+                    return;
+                }
+
+                if (RequestContract is not null)
+                {
+                    InvalidateRequestContract("CONFLICTING_STABLE_CAPTURE_OBSERVED");
+                    return;
+                }
+            }
+
+            if (RequestContract is not null && CaptureConflictsWithPromotedRequest(capture))
+                InvalidateRequestContract("LATER_CONFLICTING_SAMPLE_INVALIDATED_STABILITY");
+
+            WriteObservedRequestMetadata(capture, promoted: false);
         }
     }
 
@@ -104,52 +137,183 @@ public sealed class DiagnosticCollector
         lock (_gate)
         {
             if (RequestContract is null) return;
-
-            var currentPath = Path.GetFullPath(RequestContract.DestinationPath);
-            var forwardRename = _events
-                .Where(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase) && e.OldFullPath is not null)
-                .OrderBy(e => e.Sequence)
-                .FirstOrDefault(e => string.Equals(Path.GetFullPath(e.OldFullPath!), currentPath, StringComparison.OrdinalIgnoreCase));
-
-            if (forwardRename is not null)
+            if (!RequestContract.CaptureStabilityEstablished || _requestConflictObserved)
             {
-                var finalPath = Path.GetFullPath(forwardRename.FullPath);
-                var finalCapture = _events
-                    .Where(e => e.EvidenceStatus == "REQUEST_CONTENT_CAPTURED")
-                    .OrderByDescending(e => e.Sequence)
-                    .FirstOrDefault(e => string.Equals(Path.GetFullPath(e.FullPath), finalPath, StringComparison.OrdinalIgnoreCase));
-                var capturedBytesAreProvenAtFinalPath = finalCapture?.Sha256 is not null &&
-                    string.Equals(finalCapture.Sha256, Hashing.Sha256(RequestContract.ObservedRawBytes), StringComparison.OrdinalIgnoreCase);
-
                 RequestContract = RequestContract with
                 {
-                    DestinationPath = forwardRename.FullPath,
-                    FileName = Path.GetFileName(forwardRename.FullPath),
+                    PublicationPattern = PublicationPattern.Unknown,
+                    PublicationEvidenceEstablished = false,
+                    PublicationStrategyEvidence = "Publication cannot be promoted because stable Request capture evidence was not retained through observation finalization.",
+                    PublicationStrategyConfidence = "INCOMPLETE"
+                };
+                WriteContractFiles();
+                return;
+            }
+
+            var currentPath = Path.GetFullPath(RequestContract.DestinationPath);
+            var renames = _events
+                .Where(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase) && e.OldFullPath is not null)
+                .OrderBy(e => e.Sequence)
+                .ToArray();
+
+            var renameFromCurrent = renames.FirstOrDefault(e =>
+                string.Equals(Path.GetFullPath(e.OldFullPath!), currentPath, StringComparison.OrdinalIgnoreCase));
+            if (renameFromCurrent is not null)
+            {
+                var finalPath = Path.GetFullPath(renameFromCurrent.FullPath);
+                var finalStableCapture = FindStableCaptureEvent(finalPath, _promotedRequestHash);
+                var finalBytesEquivalent = finalStableCapture is not null;
+                RequestContract = RequestContract with
+                {
+                    DestinationPath = renameFromCurrent.FullPath,
+                    FileName = Path.GetFileName(renameFromCurrent.FullPath),
                     PublicationPattern = PublicationPattern.TempFileThenRename,
-                    PublicationStrategyEvidence = capturedBytesAreProvenAtFinalPath
-                        ? "Captured Request bytes were observed at the temporary path and the same SHA-256 was captured at the rename destination."
-                        : "A captured temporary Request was renamed to the final path, but identical final-path bytes were not captured; publication structure remains incomplete.",
-                    PublicationStrategyConfidence = capturedBytesAreProvenAtFinalPath ? "HIGH" : "INCOMPLETE",
-                    ObservedTemporaryFileName = Path.GetFileName(forwardRename.OldFullPath!),
-                    AmountFieldName = capturedBytesAreProvenAtFinalPath ? RequestContract.AmountFieldName : null
+                    PublicationStrategyEvidence = finalBytesEquivalent
+                        ? "Observed temporary filename was renamed to the final path and stable final-path bytes matched the promoted Request SHA-256."
+                        : "Observed temporary filename was renamed, but stable byte-equivalent final-path capture was not established.",
+                    PublicationStrategyConfidence = finalBytesEquivalent ? "HIGH" : "INCOMPLETE",
+                    ObservedTemporaryFileName = Path.GetFileName(renameFromCurrent.OldFullPath!),
+                    PublicationEvidenceEstablished = finalBytesEquivalent
+                };
+                WriteContractFiles();
+                return;
+            }
+
+            var renameToCurrent = renames.FirstOrDefault(e =>
+                string.Equals(Path.GetFullPath(e.FullPath), currentPath, StringComparison.OrdinalIgnoreCase));
+            if (renameToCurrent is not null)
+            {
+                RequestContract = RequestContract with
+                {
+                    PublicationPattern = PublicationPattern.TempFileThenRename,
+                    PublicationStrategyEvidence = "Observed temporary filename was renamed to the stable captured final Request path.",
+                    PublicationStrategyConfidence = "HIGH",
+                    ObservedTemporaryFileName = Path.GetFileName(renameToCurrent.OldFullPath!),
+                    PublicationEvidenceEstablished = true
+                };
+                WriteContractFiles();
+                return;
+            }
+
+            var sameHashOnDifferentPath = _events.Any(e =>
+                e.DirectoryRole == "Request" &&
+                e.EvidenceStatus == "REQUEST_CONTENT_CAPTURED_STABLE" &&
+                !string.Equals(Path.GetFullPath(e.FullPath), currentPath, StringComparison.OrdinalIgnoreCase) &&
+                _promotedRequestHash is not null &&
+                string.Equals(e.Sha256, _promotedRequestHash, StringComparison.OrdinalIgnoreCase));
+            if (sameHashOnDifferentPath)
+            {
+                RequestContract = RequestContract with
+                {
+                    PublicationPattern = PublicationPattern.OtherObservedPattern,
+                    PublicationStrategyEvidence = "Matching stable Request bytes appeared at multiple paths without a captured rename; publication method remains ambiguous.",
+                    PublicationStrategyConfidence = "INCOMPLETE",
+                    PublicationEvidenceEstablished = false
                 };
                 WriteContractFiles();
                 return;
             }
 
             var inference = PublicationPatternInferer.Infer(_events, RequestContract.DestinationPath, finalPathExistedBefore);
-            var rename = _events
-                .Where(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase) && e.OldFullPath is not null)
-                .FirstOrDefault(e => string.Equals(Path.GetFullPath(e.FullPath), Path.GetFullPath(RequestContract.DestinationPath), StringComparison.OrdinalIgnoreCase));
+            var directCreateProven = inference.Pattern == PublicationPattern.DirectCreateAndWrite &&
+                                     FindStableCaptureEvent(currentPath, _promotedRequestHash) is not null;
             RequestContract = RequestContract with
             {
                 PublicationPattern = inference.Pattern,
-                PublicationStrategyEvidence = inference.Evidence,
-                PublicationStrategyConfidence = inference.Confidence,
-                ObservedTemporaryFileName = rename?.OldFullPath is null ? null : Path.GetFileName(rename.OldFullPath)
+                PublicationStrategyEvidence = directCreateProven
+                    ? inference.Evidence + " Stable final-path bytes were captured with the promoted SHA-256."
+                    : inference.Evidence,
+                PublicationStrategyConfidence = directCreateProven ? "HIGH" : inference.Confidence,
+                ObservedTemporaryFileName = null,
+                PublicationEvidenceEstablished = directCreateProven
             };
             WriteContractFiles();
         }
+    }
+
+    private FilesystemEventRecord? FindStableCaptureEvent(string normalizedPath, string? sha) =>
+        _events
+            .Where(e => e.DirectoryRole == "Request" && e.EvidenceStatus == "REQUEST_CONTENT_CAPTURED_STABLE")
+            .OrderByDescending(e => e.Sequence)
+            .FirstOrDefault(e =>
+                string.Equals(Path.GetFullPath(e.FullPath), normalizedPath, StringComparison.OrdinalIgnoreCase) &&
+                sha is not null &&
+                string.Equals(e.Sha256, sha, StringComparison.OrdinalIgnoreCase));
+
+    private void PromoteStableRequest(ArtifactCapture capture, OperatorObservationInput input)
+    {
+        _promotedRequestHash = capture.Sha256;
+        File.WriteAllBytes(Path.Combine(SessionDirectory, "observed-request.raw"), capture.RawBytes);
+        WriteObservedRequestMetadata(capture, promoted: true);
+        RequestContract = CandidateRequestAnalyzer.Analyze(capture);
+        AmountAnalysis = AmountRelationAnalyzer.Analyze(input, RequestContract.ObservedRawAmount);
+        WriteContractFiles();
+    }
+
+    private void PersistRequestSamples(ArtifactCapture capture)
+    {
+        var seq = Interlocked.Read(ref _sequence);
+        var samples = capture.Samples;
+        if (samples is null || samples.Count == 0)
+        {
+            File.WriteAllBytes(Path.Combine(SessionDirectory, "request-candidates", $"{seq:D8}-{SafeName(capture.FileName)}.raw"), capture.RawBytes);
+            return;
+        }
+
+        foreach (var sample in samples)
+            File.WriteAllBytes(
+                Path.Combine(SessionDirectory, "request-candidates", $"{seq:D8}-s{sample.SampleNumber:D2}-{SafeName(capture.FileName)}.raw"),
+                sample.RawBytes);
+    }
+
+    private bool CaptureConflictsWithPromotedRequest(ArtifactCapture capture)
+    {
+        if (_promotedRequestHash is null) return false;
+        var samples = capture.Samples;
+        if (samples is null || samples.Count == 0)
+            return !string.Equals(capture.Sha256, _promotedRequestHash, StringComparison.OrdinalIgnoreCase);
+        return samples.Any(sample => !string.Equals(sample.Sha256, _promotedRequestHash, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void InvalidateRequestContract(string reason)
+    {
+        if (RequestContract is null) return;
+        _requestConflictObserved = true;
+        RequestContract = RequestContract with
+        {
+            CaptureStabilityEstablished = false,
+            CaptureStabilityEvidence = reason,
+            PublicationEvidenceEstablished = false,
+            PublicationStrategyConfidence = "INCOMPLETE"
+        };
+        RecordEvent("Request", "CaptureStability", RequestContract.DestinationPath,
+            status: "REQUEST_CONTENT_UNSTABLE", note: reason);
+        WriteContractFiles();
+    }
+
+    private void WriteObservedRequestMetadata(ArtifactCapture capture, bool promoted)
+    {
+        var evidence = EvidenceTextAnalyzer.Analyze(capture.RawBytes);
+        WriteJson("observed-request-metadata.json", new
+        {
+            status = promoted ? "REQUEST_CONTENT_CAPTURED_STABLE" : "REQUEST_CONTENT_CAPTURED_NOT_PROMOTED",
+            capture.FileName,
+            capture.FullPath,
+            byteLength = capture.RawBytes.Length,
+            capture.Sha256,
+            capture.CreationTimeUtc,
+            capture.LastWriteTimeUtc,
+            capture.CapturedAtUtc,
+            capture.Stability,
+            capture.SuccessfulSampleCount,
+            stabilityEstablished = capture.StabilityEstablished,
+            evidence.ProbableEncoding,
+            evidence.BomPresent,
+            evidence.NewlineRepresentation,
+            evidence.FinalNewlinePresent,
+            evidence.DecodingSafe,
+            fieldOrder = evidence.FieldNames
+        });
     }
 
     private void WriteContractFiles()
@@ -170,9 +334,14 @@ public sealed class DiagnosticCollector
             publicationPattern = RequestContract.PublicationPattern.ToString(),
             strategyEvidence = RequestContract.PublicationStrategyEvidence,
             strategyConfidence = RequestContract.PublicationStrategyConfidence,
+            publicationEvidenceEstablished = RequestContract.PublicationEvidenceEstablished,
+            captureStabilityEstablished = RequestContract.CaptureStabilityEstablished,
+            stableSampleCount = RequestContract.StableSampleCount,
+            captureStabilityEvidence = RequestContract.CaptureStabilityEvidence,
             observedTemporaryFileName = RequestContract.ObservedTemporaryFileName,
             amountFieldName = RequestContract.AmountFieldName,
             observedRawAmount = RequestContract.ObservedRawAmount,
+            normalPublishReproducible = RequestContract.HasReproducibleStructure,
             officialPecContract = false
         });
         if (AmountAnalysis is not null) WriteJson("amount-analysis.json", AmountAnalysis);
@@ -197,6 +366,8 @@ public sealed class DiagnosticCollector
                 capture.CreationTimeUtc,
                 capture.LastWriteTimeUtc,
                 capture.CapturedAtUtc,
+                capture.Stability,
+                capture.SuccessfulSampleCount,
                 evidence.ProbableEncoding,
                 evidence.BomPresent,
                 evidence.NewlineRepresentation,
@@ -258,7 +429,7 @@ public sealed class DiagnosticCollector
         var expected = new[]
         {
             "session.json","environment.json","pec-services.json","configuration.json","directory-before.json","directory-after.json",
-            "filesystem-events.jsonl","timeline.jsonl","observed-request.raw","observed-request-metadata.json","request-contract-analysis.json",
+            "filesystem-events.jsonl","timeline.jsonl","observed-request.raw","observed-request-metadata.json","request-capture-stability.json","request-contract-analysis.json",
             "published-request.raw","published-request-metadata.json","request-comparison.json","observed-response.raw","response-metadata.json",
             "response-parsing.json","amount-analysis.json","errors.jsonl","SUMMARY.md","hashes.sha256"
         };
@@ -275,9 +446,10 @@ public sealed class DiagnosticCollector
         sb.AppendLine("- PEC_ADAPTER_STATUS: `IMPLEMENTED_AGAINST_EXTERNAL_EVIDENCE`");
         sb.AppendLine("- PRODUCTION_VALIDATION: `PENDING_REAL_PEC_VALIDATION`");
         sb.AppendLine("- Official PEC contract claimed: `NO`");
-        sb.AppendLine($"- Request evidence: `{(LatestRequestCapture is null ? "MISSING_EVIDENCE" : "CAPTURED")}`");
+        sb.AppendLine($"- Request evidence: `{(RequestContract?.CaptureStabilityEstablished == true ? "STABLE_CAPTURE" : LatestRequestCapture is null ? "MISSING_EVIDENCE" : "UNSTABLE_OR_UNCONFIRMED")}`");
         sb.AppendLine($"- Response evidence: `{(LatestResponseCapture is null ? "MISSING_EVIDENCE" : "CAPTURED")}`");
         sb.AppendLine($"- Publication pattern: `{RequestContract?.PublicationPattern.ToString() ?? "UNKNOWN"}`");
+        sb.AppendLine($"- Publication evidence established: `{RequestContract?.PublicationEvidenceEstablished.ToString() ?? "False"}`");
         sb.AppendLine($"- Amount proof: `{AmountAnalysis?.ProofStatus ?? "AMOUNT_UNIT_NOT_PROVEN"}`");
         File.WriteAllText(Path.Combine(SessionDirectory, "SUMMARY.md"), sb.ToString(), Encoding.UTF8);
     }
@@ -323,7 +495,7 @@ public static class DiagnosticExporter
     private static readonly HashSet<string> SafeAllowList = new(StringComparer.OrdinalIgnoreCase)
     {
         "session.json","environment.json","pec-services.json","configuration.json","directory-before.json","directory-after.json",
-        "filesystem-events.jsonl","timeline.jsonl","observed-request-metadata.json","request-contract-analysis.json",
+        "filesystem-events.jsonl","timeline.jsonl","observed-request-metadata.json","request-capture-stability.json","request-contract-analysis.json",
         "published-request-metadata.json","request-comparison.json","response-metadata.json","response-parsing.json","amount-analysis.json",
         "errors.jsonl","SUMMARY.md","hashes.sha256","evidence-inventory.json"
     };
