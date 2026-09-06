@@ -16,6 +16,14 @@ public enum PublicationStrategy { DirectWrite, TempThenRename, OtherObserved, Un
 public enum CandidateSchemaMatch { MatchesExternalCandidate, DiffersFromExternalCandidate, InsufficientEvidence }
 public enum AmountRelationship { Unknown, Equal, RequestEqualsTesterTimes10, RequestTimes10EqualsTester, Other }
 public enum CaptureStatus { ContentCaptured, ContentNotCaptured }
+public enum CaptureStability
+{
+    NotEstablished,
+    Stable,
+    Unstable,
+    DisappearedBeforeConfirmation,
+    ConflictingEvidence
+}
 public enum CandidateResponseOutcome
 {
     CandidateSuccess,
@@ -78,6 +86,19 @@ public sealed record FilesystemEventRecord(
     string EvidenceStatus = "EVENT_OBSERVED",
     string? Note = null);
 
+public sealed record ArtifactReadSample(
+    int SampleNumber,
+    DateTimeOffset SampledAtUtc,
+    DateTime CreationTimeUtcBefore,
+    DateTime LastWriteTimeUtcBefore,
+    long LengthBefore,
+    DateTime CreationTimeUtcAfter,
+    DateTime LastWriteTimeUtcAfter,
+    long LengthAfter,
+    byte[] RawBytes,
+    string Sha256,
+    bool MetadataStableAcrossRead);
+
 public sealed record ArtifactCapture(
     string DirectoryRole,
     string FullPath,
@@ -87,7 +108,14 @@ public sealed record ArtifactCapture(
     DateTime LastWriteTimeUtc,
     byte[] RawBytes,
     string Sha256,
-    CaptureStatus Status = CaptureStatus.ContentCaptured);
+    CaptureStatus Status = CaptureStatus.ContentCaptured,
+    CaptureStability Stability = CaptureStability.NotEstablished,
+    int SuccessfulSampleCount = 1,
+    IReadOnlyList<ArtifactReadSample>? Samples = null)
+{
+    [JsonIgnore]
+    public bool StabilityEstablished => Stability == CaptureStability.Stable && SuccessfulSampleCount >= 2;
+}
 
 public sealed record TextEvidence(
     string ProbableEncoding,
@@ -111,11 +139,18 @@ public sealed record ObservedRequestContract(
     string? AmountFieldName,
     long? ObservedRawAmount,
     bool IsObservedTesterEvidence,
-    byte[] ObservedRawBytes)
+    byte[] ObservedRawBytes,
+    bool CaptureStabilityEstablished = false,
+    int StableSampleCount = 0,
+    string CaptureStabilityEvidence = "NOT_ESTABLISHED",
+    bool PublicationEvidenceEstablished = false)
 {
     [JsonIgnore]
     public bool HasReproducibleStructure =>
         IsObservedTesterEvidence &&
+        CaptureStabilityEstablished &&
+        StableSampleCount >= 2 &&
+        PublicationEvidenceEstablished &&
         TextEvidence.DecodingSafe &&
         !string.IsNullOrWhiteSpace(AmountFieldName) &&
         (PublicationPattern == PublicationPattern.DirectCreateAndWrite ||
@@ -149,7 +184,9 @@ public sealed record PublishGateInput(
     bool AmountUnitStillUnresolved,
     bool AdditionalUnresolvedUnitConfirmation,
     bool ExpertOverride,
-    PublicationStrategy? ExpertOverrideStrategy = null);
+    PublicationStrategy? ExpertOverrideStrategy = null,
+    bool UnresolvedPriorAttempt = false,
+    RequestComparison? PreparedRequestComparison = null);
 
 public sealed record PublishGateResult(bool Allowed, string Status, IReadOnlyList<string> Reasons);
 
@@ -166,6 +203,17 @@ public sealed record RequestComparison(
     string ObservedSha256,
     string PreparedSha256,
     IReadOnlyList<string> Notes);
+
+public sealed record RecoveryFinding(
+    string SessionDirectory,
+    string EvidenceSource,
+    string Status,
+    string? Detail = null);
+
+public sealed record RecoveryAssessment(
+    bool RecoveryRequired,
+    string Status,
+    IReadOnlyList<RecoveryFinding> Findings);
 
 public sealed record SanitizationFinding(
     int TokenIndex,
