@@ -32,6 +32,7 @@ public class ObservationDiagnosticsAndArchiveTests
         var capture = await FileEvidence.TryCaptureAsync("Request", file);
         Assert.NotNull(capture);
         Assert.Equal(bytes, capture!.RawBytes);
+        Assert.True(capture.StabilityEstablished);
     }
 
     [Fact]
@@ -55,8 +56,7 @@ public class ObservationDiagnosticsAndArchiveTests
         var raw = Encoding.ASCII.GetBytes("Amount=100\r\ntype=1\r\nIP=1\r\nport=2\r\n");
 
         collector.RecordEvent("Request", "Created", tempPath, status: "REQUEST_EVENT_OBSERVED");
-        collector.RecordRequestCapture(new("Request", tempPath, "tx.tmp", DateTimeOffset.UtcNow, DateTime.UtcNow, DateTime.UtcNow, raw, Hashing.Sha256(raw)),
-            new(100, TesterDisplayedUnit.Unknown));
+        collector.RecordRequestCapture(StableCapture(tempPath, "tx.tmp", raw), new(100, TesterDisplayedUnit.Unknown));
         collector.RecordEvent("Request", "Renamed", finalPath, oldPath: tempPath, status: "REQUEST_EVENT_OBSERVED");
 
         collector.FinalizePublicationPattern(finalPathExistedBefore: false);
@@ -66,6 +66,7 @@ public class ObservationDiagnosticsAndArchiveTests
         Assert.Equal(finalPath, collector.RequestContract.DestinationPath);
         Assert.Equal("tx.tmp", collector.RequestContract.ObservedTemporaryFileName);
         Assert.Equal("INCOMPLETE", collector.RequestContract.PublicationStrategyConfidence);
+        Assert.False(collector.RequestContract.PublicationEvidenceEstablished);
         Assert.False(collector.RequestContract.HasReproducibleStructure);
     }
 
@@ -145,10 +146,23 @@ public class ObservationDiagnosticsAndArchiveTests
         foreach (var scenario in Enum.GetValues<FakePecScenario>())
         {
             using var sandbox = FakePecSandbox.Create();
-            Assert.True(Path.GetFullPath(sandbox.Root).StartsWith(Path.GetFullPath(Path.GetTempPath()), StringComparison.OrdinalIgnoreCase));
+            Assert.StartsWith(Path.GetFullPath(Path.GetTempPath()), Path.GetFullPath(sandbox.Root), StringComparison.OrdinalIgnoreCase);
             var simulator = new FakePecSimulator(sandbox);
             await simulator.RunAsync(scenario);
         }
+    }
+
+    private static ArtifactCapture StableCapture(string path, string fileName, byte[] raw)
+    {
+        var now = DateTime.UtcNow;
+        var hash = Hashing.Sha256(raw);
+        var samples = new[]
+        {
+            new ArtifactReadSample(1, DateTimeOffset.UtcNow, now, now, raw.Length, now, now, raw.Length, raw, hash, true),
+            new ArtifactReadSample(2, DateTimeOffset.UtcNow, now, now, raw.Length, now, now, raw.Length, raw, hash, true)
+        };
+        return new("Request", path, fileName, DateTimeOffset.UtcNow, now, now, raw, hash,
+            CaptureStatus.ContentCaptured, CaptureStability.Stable, 2, samples);
     }
 
     private sealed class Fixture : IDisposable
