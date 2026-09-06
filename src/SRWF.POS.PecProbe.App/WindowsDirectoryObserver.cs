@@ -9,7 +9,7 @@ internal sealed class WindowsDirectoryObserver : IAsyncDisposable
     private readonly DiagnosticCollector _collector;
     private readonly OperatorObservationInput _operatorInput;
     private readonly ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc)> _pollState = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, string> _lastCapturedHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (string Hash, CaptureStability Stability)> _lastCaptureState = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<FileSystemWatcher> _watchers = [];
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
@@ -150,18 +150,38 @@ internal sealed class WindowsDirectoryObserver : IAsyncDisposable
                 return;
             }
 
-            if (_lastCapturedHash.TryGetValue(path, out var previousHash) && string.Equals(previousHash, capture.Sha256, StringComparison.OrdinalIgnoreCase))
+            if (_lastCaptureState.TryGetValue(path, out var previous) &&
+                string.Equals(previous.Hash, capture.Sha256, StringComparison.OrdinalIgnoreCase) &&
+                previous.Stability == capture.Stability &&
+                capture.Stability == CaptureStability.Stable)
                 return;
-            _lastCapturedHash[path] = capture.Sha256;
+            _lastCaptureState[path] = (capture.Sha256, capture.Stability);
+
+            var status = role == "Request"
+                ? capture.Stability switch
+                {
+                    CaptureStability.Stable => "REQUEST_CONTENT_CAPTURED_STABLE",
+                    CaptureStability.Unstable or CaptureStability.ConflictingEvidence => "REQUEST_CONTENT_UNSTABLE",
+                    CaptureStability.DisappearedBeforeConfirmation => "REQUEST_CONTENT_DISAPPEARED_BEFORE_CONFIRMATION",
+                    _ => "REQUEST_CONTENT_CAPTURED_NOT_STABLE"
+                }
+                : capture.Stability == CaptureStability.Stable
+                    ? "RESPONSE_CONTENT_CAPTURED_STABLE"
+                    : "RESPONSE_CONTENT_CAPTURED_UNCONFIRMED";
 
             _collector.RecordEvent(role, "Capture", path, length: capture.RawBytes.Length, sha: capture.Sha256,
-                status: role == "Request" ? "REQUEST_CONTENT_CAPTURED" : "RESPONSE_CONTENT_CAPTURED");
+                status: status,
+                note: $"captureStability={capture.Stability}; successfulSamples={capture.SuccessfulSampleCount}");
 
             if (role == "Request")
             {
-                if (_recordRequestAsObservedTesterEvidence) _collector.RecordRequestCapture(capture, _operatorInput);
+                if (_recordRequestAsObservedTesterEvidence)
+                    _collector.RecordRequestCapture(capture, _operatorInput);
             }
-            else _collector.RecordResponseCapture(capture);
+            else
+            {
+                _collector.RecordResponseCapture(capture);
+            }
             ArtifactCaptured?.Invoke(capture);
         }
         catch (OperationCanceledException) { }
