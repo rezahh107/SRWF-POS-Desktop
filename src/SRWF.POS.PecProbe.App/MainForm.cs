@@ -39,6 +39,7 @@ internal sealed class MainForm : Form
     private ProbeConfiguration? _currentConfig;
     private OperatorObservationInput _currentOperatorInput = new(null, TesterDisplayedUnit.Unknown);
     private IReadOnlyList<DirectorySnapshot> _beforeSnapshots = [];
+    private RecoveryAssessment _recoveryAssessment = new(false, "NO_PRIOR_PUBLISH_EVIDENCE", []);
     private bool _observing;
     private bool _publishing;
     private bool _responseCapturedDuringCurrentPublish;
@@ -103,7 +104,7 @@ internal sealed class MainForm : Form
 
         root.Controls.Add(Group("Observed Contract", Table(("Evidence", _contract))));
 
-        root.Controls.Add(Group("Publish", Table(
+        var publishTable = Table(
             ("Raw Amount", _rawAmount),
             ("MaxProbeRawAmount", _maxRawAmount),
             ("type (only when supported)", _typeValue),
@@ -112,7 +113,8 @@ internal sealed class MainForm : Form
             ("Operational timeout (s)", _operationalTimeout),
             ("Late-response window (s)", _lateWindow),
             ("Action", _startProbe),
-            ("Status", _publishStatus)))));
+            ("Status", _publishStatus));
+        root.Controls.Add(Group("Publish", publishTable));
 
         root.Controls.Add(Group("Evidence", Table(
             ("Current diagnostic folder", _diagnosticFolder),
@@ -140,8 +142,7 @@ internal sealed class MainForm : Form
         _exportSafe.Click += (_, _) => ExportSafeBundle();
         _overrideCheck.CheckedChanged += (_, _) =>
         {
-            _publishRadio.Enabled = _overrideCheck.Checked || NormalPublishEvidenceReady();
-            if (!_publishRadio.Enabled && _publishRadio.Checked) _observeRadio.Checked = true;
+            ApplyPublishAvailability();
             UpdateConnectionFieldAvailability();
         };
         _maxRawAmount.ValueChanged += (_, _) =>
@@ -163,6 +164,7 @@ internal sealed class MainForm : Form
     private async Task RefreshPreflightAsync()
     {
         var config = BuildConfiguration();
+        RefreshDurableRecoveryState(config);
         var request = await FileEvidence.SnapshotDirectoryAsync("Request", config.RequestDirectory);
         var response = await FileEvidence.SnapshotDirectoryAsync("Response", config.ResponseDirectory);
         var services = WindowsServiceInspector.FindCandidates();
@@ -172,6 +174,16 @@ internal sealed class MainForm : Form
         sb.AppendLine($"Base exists: {baseExists}");
         sb.AppendLine($"Request: exists={request.Exists}, enumerable={request.Enumerable}, files={request.Files.Count}");
         sb.AppendLine($"Response: exists={response.Exists}, enumerable={response.Enumerable}, files={response.Files.Count}");
+        if (_recoveryAssessment.RecoveryRequired)
+        {
+            sb.AppendLine($"Recovery: RECOVERY_REQUIRED — durable prior publish evidence found in {_recoveryAssessment.Findings.Count} session(s)/marker(s). Provider-folder absence does not clear this block.");
+            foreach (var finding in _recoveryAssessment.Findings.Take(5))
+                sb.AppendLine($"Recovery evidence: {Path.GetFileName(finding.SessionDirectory)} | {finding.EvidenceSource} | {finding.Status}");
+        }
+        else
+        {
+            sb.AppendLine("Recovery: no durable prior publish-attempt evidence detected. This is not a PEC outcome claim.");
+        }
         if (services.Count == 0) sb.AppendLine("Candidate PEC/PCPOS service: NOT FOUND (not proof that PEC is absent)");
         foreach (var svc in services)
             sb.AppendLine($"Service: {svc.ServiceName} | {svc.DisplayName} | {svc.Status} | Start={svc.StartType} | Path={svc.ExecutablePath ?? "UNKNOWN"}");
@@ -248,7 +260,7 @@ internal sealed class MainForm : Form
         _collector.Complete("OBSERVATION_STOPPED");
         _archiveArtifacts.Enabled = true;
         UpdateContractUi();
-        _publishRadio.Enabled = NormalPublishEvidenceReady() || _overrideCheck.Checked;
+        ApplyPublishAvailability();
     }
 
     private void OnArtifactCaptured(ArtifactCapture capture)
@@ -268,14 +280,17 @@ internal sealed class MainForm : Form
     private async Task StartPublishAsync()
     {
         if (_observing || _publishing) return;
+
+        var config = BuildConfiguration();
+        RefreshDurableRecoveryState(config);
+        if (_unresolvedPublishedAttempt)
+        {
+            MessageBox.Show("RECOVERY_REQUIRED / UNKNOWN: durable evidence indicates a prior PUBLISH attempt may be unresolved. Empty provider folders and UNVERIFIED PUBLISH OVERRIDE do not permit a second Request.");
+            return;
+        }
         if (!_publishRadio.Checked)
         {
             MessageBox.Show("Select PUBLISH mode explicitly. OBSERVE ONLY is the default and never dispatches a Request.");
-            return;
-        }
-        if (_unresolvedPublishedAttempt)
-        {
-            MessageBox.Show("A prior PUBLISH attempt in this process remains unresolved/candidate-only. No second Request will be sent automatically or as a normal retry.");
             return;
         }
         if (!long.TryParse(_rawAmount.Text.Trim(), out var rawAmount))
@@ -284,11 +299,10 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var config = BuildConfiguration();
         var expertOverride = _overrideCheck.Checked;
         if (!expertOverride && (_collector?.RequestContract is null || !NormalPublishEvidenceReady()))
         {
-            MessageBox.Show("PUBLISH is locked: observed Tester evidence is insufficient. Start with OBSERVE ONLY.");
+            MessageBox.Show("PUBLISH is locked: stable observed Tester evidence/publication evidence is insufficient. Start with OBSERVE ONLY.");
             return;
         }
 
@@ -300,7 +314,6 @@ internal sealed class MainForm : Form
         var responseSnapshot = await FileEvidence.SnapshotDirectoryAsync("Response", config.ResponseDirectory);
         var staleRequest = requestSnapshot.Files.Count > 0;
         var staleResponse = responseSnapshot.Files.Count > 0;
-        if (_unresolvedPublishedAttempt) staleRequest = true;
 
         var unresolvedUnitConfirmed = MessageBox.Show(
             "PEC amount unit is still NOT PROVEN.\n\nThe value below will be published exactly as RAW units with NO Rial/Toman conversion:\n\n" + rawAmount +
@@ -309,32 +322,13 @@ internal sealed class MainForm : Form
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Warning) == DialogResult.Yes;
 
-        var expertStrategy = expertOverride ? ReadOverrideStrategy() : (PublicationStrategy?)null;
-        var amountObserved = _collector.AmountAnalysis?.Status == "AMOUNT_RELATION_OBSERVED";
-        var gate = PublishGate.Evaluate(new(
-            _collector.RequestContract,
-            rawAmount,
-            (long)_maxRawAmount.Value,
-            staleRequest,
-            staleResponse,
-            amountObserved,
-            AmountUnitStillUnresolved: true,
-            AdditionalUnresolvedUnitConfirmation: unresolvedUnitConfirmed,
-            ExpertOverride: expertOverride,
-            ExpertOverrideStrategy: expertStrategy));
-
-        if (!gate.Allowed)
-        {
-            _publishStatus.Text = gate.Status + ": " + string.Join(", ", gate.Reasons);
-            MessageBox.Show(_publishStatus.Text);
-            return;
-        }
-
         var contract = _collector.RequestContract;
+        var expertStrategy = expertOverride ? ReadOverrideStrategy() : (PublicationStrategy?)null;
         PublicationStrategy strategy;
         string destinationPath;
         byte[] prepared;
         RequestComparison comparison;
+        IReadOnlyCollection<string> dynamicFields = [];
 
         if (expertOverride)
         {
@@ -356,8 +350,9 @@ internal sealed class MainForm : Form
             var overrides = SupportedConnectionOverrides(contract);
             var render = RequestTemplateRenderer.Render(contract, rawAmount, overrides);
             prepared = render.Bytes;
+            dynamicFields = render.ReplacedFields;
             destinationPath = contract.DestinationPath;
-            comparison = RequestComparer.Compare(contract.ObservedRawBytes, prepared);
+            comparison = RequestComparer.Compare(contract.ObservedRawBytes, prepared, dynamicFields);
         }
         else
         {
@@ -380,6 +375,34 @@ internal sealed class MainForm : Form
             return;
         }
 
+        _collector.RecordPublishedRequest(prepared, strategy,
+            expertOverride ? "Explicit UNVERIFIED PUBLISH OVERRIDE" : contract!.PublicationStrategyEvidence,
+            expertOverride ? "UNVERIFIED" : contract!.PublicationStrategyConfidence,
+            rawAmount,
+            comparison);
+
+        var amountObserved = _collector.AmountAnalysis?.Status == "AMOUNT_RELATION_OBSERVED";
+        var gate = PublishGate.Evaluate(new(
+            contract,
+            rawAmount,
+            (long)_maxRawAmount.Value,
+            staleRequest,
+            staleResponse,
+            amountObserved,
+            AmountUnitStillUnresolved: true,
+            AdditionalUnresolvedUnitConfirmation: unresolvedUnitConfirmed,
+            ExpertOverride: expertOverride,
+            ExpertOverrideStrategy: expertStrategy,
+            UnresolvedPriorAttempt: _unresolvedPublishedAttempt,
+            PreparedRequestComparison: comparison));
+
+        if (!gate.Allowed)
+        {
+            _publishStatus.Text = gate.Status + ": " + string.Join(", ", gate.Reasons);
+            MessageBox.Show(_publishStatus.Text);
+            return;
+        }
+
         _collector.WriteJson("prepublish-directory-snapshot.json", new { requestSnapshot, responseSnapshot, capturedAtUtc = DateTimeOffset.UtcNow });
         _collector.WriteJson("publish-attempt.json", new
         {
@@ -390,13 +413,10 @@ internal sealed class MainForm : Form
             maxProbeRawAmount = (long)_maxRawAmount.Value,
             amountUnit = "UNRESOLVED_RAW_UNITS",
             automaticRetry = false,
-            expertOverride
+            expertOverride,
+            comparisonResult = comparison.Result
         });
-        _collector.RecordPublishedRequest(prepared, strategy,
-            expertOverride ? "Explicit UNVERIFIED PUBLISH OVERRIDE" : contract!.PublicationStrategyEvidence,
-            expertOverride ? "UNVERIFIED" : contract!.PublicationStrategyConfidence,
-            rawAmount,
-            comparison);
+        _unresolvedPublishedAttempt = true;
 
         _currentConfig = config;
         _responseCapturedDuringCurrentPublish = false;
@@ -426,7 +446,6 @@ internal sealed class MainForm : Form
 
             if (!_responseCapturedDuringCurrentPublish)
             {
-                _unresolvedPublishedAttempt = true;
                 _collector.RecordEvent("Publish", "Timeout", destinationPath, status: "UNKNOWN", note: "Probe operational timeout expired. This is not a PEC failure determination.");
                 _publishStatus.Text = "UNKNOWN — operational timeout expired. Late-response observation continues; no automatic retry.";
 
@@ -446,14 +465,12 @@ internal sealed class MainForm : Form
             }
             else
             {
-                _unresolvedPublishedAttempt = true; // Candidate mapping is not yet authoritative PEC contract evidence.
                 var candidate = _collector.ResponseParsing?.Label ?? "Response captured; parser evidence unavailable";
-                _publishStatus.Text = $"Response captured before interpretation. {candidate}. REAL_PEC_VALIDATION_PENDING.";
+                _publishStatus.Text = $"Response captured before interpretation. {candidate}. REAL_PEC_VALIDATION_PENDING. Prior attempt remains recovery-blocking because candidate response evidence is not authoritative safe-to-retry proof.";
             }
         }
         catch (Exception ex)
         {
-            _unresolvedPublishedAttempt = true;
             _collector.RecordError("PUBLISH_DISPATCH_ERROR", ex);
             _publishStatus.Text = "RECOVERY_REQUIRED / UNKNOWN: " + ex.Message;
         }
@@ -466,7 +483,8 @@ internal sealed class MainForm : Form
             var requestAfter = await FileEvidence.SnapshotDirectoryAsync("Request", config.RequestDirectory);
             var responseAfter = await FileEvidence.SnapshotDirectoryAsync("Response", config.ResponseDirectory);
             _collector.WriteDirectoryAfter(new[] { requestAfter, responseAfter });
-            _collector.Complete(_unresolvedPublishedAttempt ? "PUBLISH_EVIDENCE_REQUIRES_REVIEW" : "PUBLISH_COMPLETED");
+            _collector.Complete("PUBLISH_EVIDENCE_REQUIRES_REVIEW");
+            ApplyPublishAvailability();
         }
     }
 
@@ -557,7 +575,10 @@ internal sealed class MainForm : Form
         var a = _collector?.AmountAnalysis;
         if (c is null)
         {
-            _contract.Text = "Request content not captured yet. REQUEST_CONTENT_NOT_CAPTURED is a valid evidence outcome when a transient file is missed.";
+            var latest = _collector?.LatestRequestCapture;
+            _contract.Text = latest is null
+                ? "Request content not captured yet. REQUEST_CONTENT_NOT_CAPTURED is a valid evidence outcome when a transient file is missed."
+                : $"Request candidate captured but not promotable: stability={latest.Stability}; successfulSamples={latest.SuccessfulSampleCount}. Normal PUBLISH remains locked.";
             return;
         }
 
@@ -566,7 +587,8 @@ internal sealed class MainForm : Form
             $"Encoding: {c.TextEvidence.ProbableEncoding}; BOM={c.TextEvidence.BomPresent}; newline={c.TextEvidence.NewlineRepresentation}; final newline={c.TextEvidence.FinalNewlinePresent}\n" +
             $"Field order: {string.Join(" → ", c.TextEvidence.FieldNames)}\n" +
             $"Candidate schema: {c.CandidateSchemaMatch}\n" +
-            $"Publication pattern: {c.PublicationPattern}; temp name={c.ObservedTemporaryFileName ?? "UNKNOWN"}; confidence={c.PublicationStrategyConfidence}\n" +
+            $"Capture stability: {c.CaptureStabilityEstablished}; samples={c.StableSampleCount}; evidence={c.CaptureStabilityEvidence}\n" +
+            $"Publication pattern: {c.PublicationPattern}; temp name={c.ObservedTemporaryFileName ?? "UNKNOWN"}; confidence={c.PublicationStrategyConfidence}; publication evidence={c.PublicationEvidenceEstablished}\n" +
             $"Observed Tester input: {a?.TesterEnteredAmount?.ToString() ?? "UNKNOWN"} {a?.TesterDisplayedUnit}\n" +
             $"Observed Request amount: {a?.ObservedRequestAmount?.ToString() ?? "UNKNOWN"}\n" +
             $"Candidate relationship: {a?.Relationship}; confidence={a?.Confidence}; {a?.ProofStatus ?? "AMOUNT_UNIT_NOT_PROVEN"}";
@@ -577,7 +599,25 @@ internal sealed class MainForm : Form
     private bool NormalPublishEvidenceReady()
     {
         var c = _collector?.RequestContract;
-        return c is not null && c.HasReproducibleStructure && _collector?.AmountAnalysis?.Status == "AMOUNT_RELATION_OBSERVED";
+        return !_unresolvedPublishedAttempt &&
+               c is not null &&
+               c.HasReproducibleStructure &&
+               _collector?.AmountAnalysis?.Status == "AMOUNT_RELATION_OBSERVED";
+    }
+
+    private void RefreshDurableRecoveryState(ProbeConfiguration config)
+    {
+        _recoveryAssessment = SessionRecoveryClassifier.Assess(config.DiagnosticsRoot);
+        if (_recoveryAssessment.RecoveryRequired)
+            _unresolvedPublishedAttempt = true;
+        ApplyPublishAvailability();
+    }
+
+    private void ApplyPublishAvailability()
+    {
+        _publishRadio.Enabled = !_unresolvedPublishedAttempt && (_overrideCheck.Checked || NormalPublishEvidenceReady());
+        if (!_publishRadio.Enabled && _publishRadio.Checked)
+            _observeRadio.Checked = true;
     }
 
     private IReadOnlyDictionary<string, string> SupportedConnectionOverrides(ObservedRequestContract contract)
