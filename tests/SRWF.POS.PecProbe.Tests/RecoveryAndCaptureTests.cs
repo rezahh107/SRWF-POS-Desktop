@@ -295,7 +295,7 @@ public class RecoveryAndCaptureTests
     {
         File.WriteAllLines(
             Path.Combine(sessionDirectory, "timeline.jsonl"),
-            events.Select(JsonSerializer.Serialize));
+            events.Select(e => JsonSerializer.Serialize(e)));
     }
 
     private sealed class TempDirectory : IDisposable
