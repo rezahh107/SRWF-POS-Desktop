@@ -28,7 +28,13 @@ public static class CandidateRequestAnalyzer
             string.IsNullOrWhiteSpace(amountName) ? null : amountName,
             amount,
             true,
-            capture.RawBytes);
+            capture.RawBytes,
+            capture.StabilityEstablished,
+            capture.StabilityEstablished ? capture.SuccessfulSampleCount : 0,
+            capture.StabilityEstablished
+                ? $"At least two bounded shared-read samples matched with stable pre/post metadata; successfulSamples={capture.SuccessfulSampleCount}."
+                : $"Capture stability not established; state={capture.Stability}; successfulSamples={capture.SuccessfulSampleCount}.",
+            PublicationEvidenceEstablished: false);
     }
 
     public static CandidateSchemaMatch ClassifySchema(TextEvidence evidence)
@@ -61,19 +67,30 @@ public static class PublicationPatternInferer
                               string.Equals(Path.GetFullPath(e.FullPath), normalized, StringComparison.OrdinalIgnoreCase)))
             return (PublicationPattern.TempFileThenRename, "A rename event made the observed final path visible.", "HIGH");
 
-        if (finalPathExistedBefore && relevant.Any(e => e.EventType.Equals("Deleted", StringComparison.OrdinalIgnoreCase)) &&
-                                      relevant.Any(e => e.EventType.Equals("Created", StringComparison.OrdinalIgnoreCase)))
+        if (finalPathExistedBefore && relevant.Any(e => IsDeleteEvent(e.EventType)) &&
+                                      relevant.Any(e => IsCreateEvent(e.EventType)))
             return (PublicationPattern.ReplaceExisting, "The final path existed before observation and delete/create activity was observed.", "MEDIUM");
 
-        if (relevant.Any(e => e.EventType.Equals("Created", StringComparison.OrdinalIgnoreCase)) ||
-            relevant.Any(e => e.EventType.Equals("Changed", StringComparison.OrdinalIgnoreCase)))
-            return (PublicationPattern.DirectCreateAndWrite, "Create/change activity was observed directly on the final path without a captured rename.", "MEDIUM");
+        if (relevant.Any(e => IsCreateEvent(e.EventType)) &&
+            !relevant.Any(e => e.EventType.Equals("Renamed", StringComparison.OrdinalIgnoreCase)))
+            return (PublicationPattern.DirectCreateAndWrite, "Positive create visibility was observed directly on the final path without conflicting rename evidence.", "MEDIUM");
+
+        if (relevant.Any(e => e.EventType.Contains("Changed", StringComparison.OrdinalIgnoreCase)))
+            return (PublicationPattern.OtherObservedPattern, "Changed-only activity was observed on the path; this is insufficient to prove DIRECT_CREATE_AND_WRITE.", "LOW");
 
         if (events.Any())
             return (PublicationPattern.OtherObservedPattern, "Filesystem activity was observed but does not support a known publication pattern.", "LOW");
 
         return (PublicationPattern.Unknown, "No sufficient publication evidence was captured.", "LOW");
     }
+
+    private static bool IsCreateEvent(string eventType) =>
+        eventType.Equals("Created", StringComparison.OrdinalIgnoreCase) ||
+        eventType.Equals("PollCreated", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDeleteEvent(string eventType) =>
+        eventType.Equals("Deleted", StringComparison.OrdinalIgnoreCase) ||
+        eventType.Equals("PollDeleted", StringComparison.OrdinalIgnoreCase);
 }
 
 public static class AmountRelationAnalyzer
